@@ -1,6 +1,6 @@
 ---
 name: configure
-description: Set up the Telegram channel — save the bot token and review access policy. Use when the user pastes a Telegram bot token, asks to configure Telegram, asks "how do I set this up" or "who can reach me," or wants to check channel status.
+description: Set up the Telegram mailbox — save the bot token and review access policy. Use when the user pastes a Telegram bot token for the mailbox bot, asks to configure telegram-mailbox, asks "how do I set this up" or "who can reach me," or wants to check mailbox status.
 user-invocable: true
 allowed-tools:
   - Read
@@ -9,9 +9,9 @@ allowed-tools:
   - Bash(mkdir *)
 ---
 
-# /telegram:configure — Telegram Channel Setup
+# /telegram-mailbox:configure — Telegram Mailbox Setup
 
-Writes the bot token to `~/.claude/channels/telegram/.env` and orients the
+Writes the bot token to `~/.claude/channels/telegram-mailbox/.env` and orients the
 user on access policy. The server reads both files at boot.
 
 Arguments passed: `$ARGUMENTS`
@@ -24,21 +24,21 @@ Arguments passed: `$ARGUMENTS`
 
 Read both state files and give the user a complete picture:
 
-1. **Token** — check `~/.claude/channels/telegram/.env` for
+1. **Token** — check `~/.claude/channels/telegram-mailbox/.env` for
    `TELEGRAM_BOT_TOKEN`. Show set/not-set; if set, show first 10 chars masked
    (`123456789:...`).
 
-2. **Access** — read `~/.claude/channels/telegram/access.json` (missing file
+2. **Access** — read `~/.claude/channels/telegram-mailbox/access.json` (missing file
    = defaults: `dmPolicy: "pairing"`, empty allowlist). Show:
    - DM policy and what it means in one line
    - Allowed senders: count, and list display names or IDs
    - Pending pairings: count, with codes and display names if any
 
 3. **What next** — end with a concrete next step based on state:
-   - No token → *"Run `/telegram:configure <token>` with the token from
+   - No token → *"Run `/telegram-mailbox:configure <token>` with the token from
      BotFather."*
    - Token set, policy is pairing, nobody allowed → *"DM your bot on
-     Telegram. It replies with a code; approve with `/telegram:access pair
+     Telegram. It replies with a code; approve with `/telegram-mailbox:access pair
      <code>`."*
    - Token set, someone allowed → *"Ready. DM your bot to reach the
      assistant."*
@@ -54,10 +54,10 @@ Drive the conversation this way:
 2. Ask: *"Is that everyone who should reach you through this bot?"*
 3. **If yes and policy is still `pairing`** → *"Good. Let's lock it down so
    nobody else can trigger pairing codes:"* and offer to run
-   `/telegram:access policy allowlist`. Do this proactively — don't wait to
+   `/telegram-mailbox:access policy allowlist`. Do this proactively — don't wait to
    be asked.
 4. **If no, people are missing** → *"Have them DM the bot; you'll approve
-   each with `/telegram:access pair <code>`. Run this skill again once
+   each with `/telegram-mailbox:access pair <code>`. Run this skill again once
    everyone's in and we'll lock it."*
 5. **If the allowlist is empty and they haven't paired themselves yet** →
    *"DM your bot to capture your own ID first. Then we'll add anyone else
@@ -65,7 +65,7 @@ Drive the conversation this way:
 6. **If policy is already `allowlist`** → confirm this is the locked state.
    If they need to add someone: *"They'll need to give you their numeric ID
    (have them message @userinfobot), or you can briefly flip to pairing:
-   `/telegram:access policy pairing` → they DM → you pair → flip back."*
+   `/telegram-mailbox:access policy pairing` → they DM → you pair → flip back."*
 
 Never frame `pairing` as the correct long-term choice. Don't skip the lockdown
 offer.
@@ -74,10 +74,10 @@ offer.
 
 1. Treat `$ARGUMENTS` as the token (trim whitespace). BotFather tokens look
    like `123456789:AAH...` — numeric prefix, colon, long string.
-2. `mkdir -p ~/.claude/channels/telegram`
+2. `mkdir -p ~/.claude/channels/telegram-mailbox`
 3. Read existing `.env` if present; update/add the `TELEGRAM_BOT_TOKEN=` line,
    preserve other keys. Write back, no quotes around the value.
-4. `chmod 600 ~/.claude/channels/telegram/.env` — the token is a credential.
+4. `chmod 600 ~/.claude/channels/telegram-mailbox/.env` — the token is a credential.
 5. Confirm, then show the no-args status so the user sees where they stand.
 
 ### `clear` — remove the token
@@ -93,4 +93,4 @@ Delete the `TELEGRAM_BOT_TOKEN=` line (or the file if that's the only line).
 - The server reads `.env` once at boot. Token changes need a session restart
   or `/reload-plugins`. Say so after saving.
 - `access.json` is re-read on every inbound message — policy changes via
-  `/telegram:access` take effect immediately, no restart.
+  `/telegram-mailbox:access` take effect immediately, no restart.

@@ -1,11 +1,11 @@
 {
-  "name": "telegram",
-  "description": "Telegram channel for Claude Code \u2014 messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /telegram:access.",
-  "version": "0.0.6",
+  "name": "telegram-mailbox",
+  "description": "Telegram mailbox for Claude Code — inbound messages persist to mailbox.jsonl and are drained by /telegram-mailbox:mailbox-check inside a /loop. No --channels flag required. Forked from anthropics/claude-plugins-official telegram plugin.",
+  "version": "0.0.1",
   "keywords": [
     "telegram",
     "messaging",
-    "channel",
+    "mailbox",
     "mcp"
   ]
 }
