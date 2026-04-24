@@ -42,13 +42,23 @@ Both plugins can run side-by-side as long as they use different bot tokens (Tele
 
    The token is written to `~/.claude/channels/telegram-mailbox/.env` (chmod 600) and never leaves your machine.
 
-5. **Pair yourself.** Run:
+5. **Pair yourself and lock down to an allowlist.** The default `dmPolicy` is `pairing` — new senders get a 6-char code back instead of being forwarded.
 
-   ```
-   /telegram-mailbox:access
-   ```
+   a. From the Telegram account you want to allow, DM your bot any message (e.g. `hi`). The bot replies with a 6-char pairing code.
 
-   Follow the prompts to DM your bot from the Telegram account you want to allowlist, then switch policy from `pairing` to `allowlist` for lockdown.
+   b. In Claude, approve the code (this adds your Telegram user ID to `allowFrom`):
+
+      ```
+      /telegram-mailbox:access pair <code>
+      ```
+
+   c. Switch policy to allowlist so unknown senders are ignored instead of getting a pairing code:
+
+      ```
+      /telegram-mailbox:access policy allowlist
+      ```
+
+   d. (Optional) Confirm state — `/telegram-mailbox:access` with no args prints the current `dmPolicy` and `allowFrom` list.
 
 6. **Verify.** DM your bot from the allowlisted account. The message should land in `~/.claude/channels/telegram-mailbox/mailbox.jsonl`.
 
