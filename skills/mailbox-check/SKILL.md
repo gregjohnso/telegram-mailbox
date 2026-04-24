@@ -43,7 +43,7 @@ The `mailbox_read_new` tool only returns messages that already passed the server
 
 ## Running under /loop (dynamic mode)
 
-When invoked by `/loop /telegram-mailbox:mailbox-check` with no interval, arm a Monitor on the mailbox file so new messages wake the loop within seconds instead of waiting for the fallback heartbeat. Do this **before** draining, so a Monitor is in place even when the current batch is empty.
+When invoked by `/loop /telegram-mailbox:mailbox-check` with no interval, arm a Monitor on the mailbox file so new messages wake the loop within seconds. The Monitor is the **sole** wake signal — do not call `ScheduleWakeup` to add a fallback heartbeat. Idle ticks would just burn a cache miss every ~25min with nothing to do; the Monitor is persistent and will fire as soon as new entries land. Do this **before** draining, so a Monitor is in place even when the current batch is empty.
 
 1. Call `TaskList`. If an existing persistent task's description mentions "telegram mailbox", it's already armed — skip to step 3.
 2. Arm the monitor (emits once per burst; quiets while there's unprocessed work so it doesn't spam during drain):
@@ -70,7 +70,7 @@ When invoked by `/loop /telegram-mailbox:mailbox-check` with no interval, arm a 
    ```
 
 3. Drain the mailbox per the Flow section above.
-4. At end of turn, `ScheduleWakeup` with `delaySeconds: 1500` (safety-net heartbeat — the Monitor is the primary wake signal, so the fallback can sit well past the 5-minute cache window without costing responsiveness).
+4. End the turn. Do not call `ScheduleWakeup` — the Monitor wakes the loop on its own when new entries arrive.
 
 ## Pause sentinel
 
