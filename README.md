@@ -20,7 +20,7 @@ Both plugins can run side-by-side as long as they use different bot tokens (Tele
 
 ## Setup
 
-1. **Create a bot.** In Telegram, DM [@BotFather](https://t.me/BotFather) and run `/newbot`. Follow the prompts to name the bot. BotFather replies with an HTTP API token — that's the `<bot-token>` referenced below. Do not reuse the official `telegram` plugin's token; Telegram returns 409 Conflict if two pollers share one.
+1. **Get a bot token from BotFather.** In Telegram, DM [@BotFather](https://t.me/BotFather), run `/newbot`, and follow the prompts to name the bot. BotFather replies with an HTTP API token — that's the `<bot-token>` referenced below.
 
 2. **(Recommended) Harden the bot in BotFather.** `/mybots → <your bot> → Bot Settings`:
    - `Allow Groups? → Disable` (DM-only)
