@@ -16,25 +16,41 @@ Both plugins can run side-by-side as long as they use different bot tokens (Tele
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) — `curl -fsSL https://bun.sh/install | bash`
-- A second Telegram bot from [@BotFather](https://t.me/BotFather) (do not reuse the official plugin's token)
-
-## Install
-
-```
-/plugin install <path-to-this-repo>
-```
-
-Then restart Claude so the MCP server starts.
+- [Bun](https://bun.sh) — `curl -fsSL https://bun.sh/install | bash`. Make sure `~/.bun/bin` is on your `$PATH` in whichever shell launches Claude Code.
 
 ## Setup
 
-```
-/telegram-mailbox:configure 123456789:AAH...
-/telegram-mailbox:access                    # pair yourself, then switch policy to allowlist
-```
+1. **Create a bot.** In Telegram, DM [@BotFather](https://t.me/BotFather) and run `/newbot`. Follow the prompts to name the bot. BotFather replies with an HTTP API token — that's the `<bot-token>` referenced below. Do not reuse the official `telegram` plugin's token; Telegram returns 409 Conflict if two pollers share one.
 
-Recommended BotFather hardening: `/mybots → <bot> → Bot Settings → Allow Groups? → Disable`, `Privacy → Enable`.
+2. **(Recommended) Harden the bot in BotFather.** `/mybots → <your bot> → Bot Settings`:
+   - `Allow Groups? → Disable` (DM-only)
+   - `Group Privacy → Enable` (only @mentions and replies reach the bot in any group)
+
+3. **Install the plugin.** Clone this repo, then:
+
+   ```
+   /plugin install <path-to-this-repo>
+   ```
+
+   Restart Claude Code so the MCP server starts.
+
+4. **Save the token.** In any Claude session:
+
+   ```
+   /telegram-mailbox:configure <bot-token>
+   ```
+
+   The token is written to `~/.claude/channels/telegram-mailbox/.env` (chmod 600) and never leaves your machine.
+
+5. **Pair yourself.** Run:
+
+   ```
+   /telegram-mailbox:access
+   ```
+
+   Follow the prompts to DM your bot from the Telegram account you want to allowlist, then switch policy from `pairing` to `allowlist` for lockdown.
+
+6. **Verify.** DM your bot from the allowlisted account. The message should land in `~/.claude/channels/telegram-mailbox/mailbox.jsonl`.
 
 ## Use
 
