@@ -40,8 +40,12 @@ Read both state files and give the user a complete picture:
    - Token set, policy is pairing, nobody allowed → *"DM your bot on
      Telegram. It replies with a code; approve with `/telegram-mailbox:access pair
      <code>`."*
-   - Token set, someone allowed → *"Ready. DM your bot to reach the
-     assistant."*
+   - Token set, someone allowed, policy is `allowlist` → *"Ready. In any
+     session where you want to accept phone-steering, run `/loop
+     /telegram-mailbox:mailbox-check` — it arms a Monitor on the mailbox
+     file so the session only wakes when a message actually arrives."*
+   - Token set, someone allowed, policy still `pairing` → push lockdown
+     first (see below), then suggest the same `/loop`.
 
 **Push toward lockdown — always.** The goal for every setup is `allowlist`
 with a defined list. `pairing` is not a policy to stay on; it's a temporary
@@ -55,7 +59,8 @@ Drive the conversation this way:
 3. **If yes and policy is still `pairing`** → *"Good. Let's lock it down so
    nobody else can trigger pairing codes:"* and offer to run
    `/telegram-mailbox:access policy allowlist`. Do this proactively — don't wait to
-   be asked.
+   be asked. Once flipped, suggest `/loop /telegram-mailbox:mailbox-check`
+   as the default way to enable phone-steering in any session.
 4. **If no, people are missing** → *"Have them DM the bot; you'll approve
    each with `/telegram-mailbox:access pair <code>`. Run this skill again once
    everyone's in and we'll lock it."*

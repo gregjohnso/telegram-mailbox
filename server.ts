@@ -956,7 +956,6 @@ async function handleInbound(
     return
   }
 
-  void result.access  // gate() validated access; mailbox path doesn't need the policy object
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
@@ -965,6 +964,18 @@ async function handleInbound(
   if (!rateLimitAllow(String(from.id))) {
     maybeReplyRateLimited(ctx, String(from.id))
     return
+  }
+
+  // Ack receipt with an emoji reaction on the sender's message. Default 👀;
+  // empty string in access.json disables. Fire-and-forget — a bad emoji or
+  // missing group reaction perms shouldn't block mailbox delivery.
+  const ackEmoji = result.access.ackReaction ?? '👀'
+  if (ackEmoji && msgId != null) {
+    void bot.api.setMessageReaction(chat_id, msgId, [
+      { type: 'emoji', emoji: ackEmoji as ReactionTypeEmoji['emoji'] },
+    ]).catch(err => {
+      process.stderr.write(`telegram-mailbox: ackReaction failed: ${err}\n`)
+    })
   }
 
   // Download images eagerly — file_ids expire, and /loop may not drain the
@@ -992,7 +1003,6 @@ async function handleInbound(
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     appendFileSync(MAILBOX_FILE, JSON.stringify(entry) + '\n', { mode: 0o600 })
-    await ctx.reply('✓ queued')
   } catch (err) {
     process.stderr.write(`telegram-mailbox: failed to append mailbox entry: ${err}\n`)
   }

@@ -1,6 +1,6 @@
 ---
 name: mailbox-check
-description: Drain the telegram-mailbox queue — read unprocessed inbound messages, act on them in the current session, reply via Telegram, advance the cursor. Intended to be run under /loop (e.g. `/loop 60s /telegram-mailbox:mailbox-check`) so a long-running session can be steered from your phone. Use when the user says they want phone-steering, when running under /loop to poll for phone messages, or when the user asks to check the mailbox.
+description: Drain the telegram-mailbox queue — read unprocessed inbound messages, act on them in the current session, reply via Telegram, advance the cursor. Intended to be run under /loop (e.g. `/loop /telegram-mailbox:mailbox-check`) so a long-running session can be steered from your phone. Use when the user says they want phone-steering, when running under /loop for phone messages, or when the user asks to check the mailbox.
 user-invocable: true
 allowed-tools:
   - mcp__telegram-mailbox__mailbox_read_new
@@ -40,6 +40,37 @@ The `mailbox_read_new` tool only returns messages that already passed the server
 4. If the entry has `image_path`, Read it before acting — it's a photo the sender attached.
 5. If the entry has `attachment_file_id`, call `download_attachment` to fetch it to the inbox, then Read that path.
 6. After processing the batch (or failing partway), call `mailbox_ack` with `through_offset` set to the offset up to and including the last entry you successfully handled. On partial failure, `through_offset` is the offset *after* the last successful entry so the rest are retried on the next tick.
+
+## Running under /loop (dynamic mode)
+
+When invoked by `/loop /telegram-mailbox:mailbox-check` with no interval, arm a Monitor on the mailbox file so new messages wake the loop within seconds instead of waiting for the fallback heartbeat. Do this **before** draining, so a Monitor is in place even when the current batch is empty.
+
+1. Call `TaskList`. If an existing persistent task's description mentions "telegram mailbox", it's already armed — skip to step 3.
+2. Arm the monitor (emits once per burst; quiets while there's unprocessed work so it doesn't spam during drain):
+
+   ```
+   Monitor({
+     description: "new telegram mailbox entries",
+     persistent: true,
+     timeout_ms: 3600000,
+     command: `mbox=~/.claude/channels/telegram-mailbox/mailbox.jsonl
+   offs=~/.claude/channels/telegram-mailbox/processed_offset
+   while true; do
+     size=$(stat -c%s "$mbox" 2>/dev/null || echo 0)
+     processed=$(cat "$offs" 2>/dev/null || echo 0)
+     if [ "$size" -gt "$processed" ]; then
+       echo "new mailbox entries: size=$size processed=$processed"
+       while [ "$(stat -c%s "$mbox" 2>/dev/null || echo 0)" -gt "$(cat "$offs" 2>/dev/null || echo 0)" ]; do
+         sleep 5
+       done
+     fi
+     sleep 3
+   done`
+   })
+   ```
+
+3. Drain the mailbox per the Flow section above.
+4. At end of turn, `ScheduleWakeup` with `delaySeconds: 1500` (safety-net heartbeat — the Monitor is the primary wake signal, so the fallback can sit well past the 5-minute cache window without costing responsiveness).
 
 ## Pause sentinel
 
