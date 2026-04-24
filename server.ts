@@ -41,7 +41,7 @@ try {
   // Token is a credential — lock to owner. No-op on Windows (would need ACLs).
   chmodSync(ENV_FILE, 0o600)
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
-    const m = line.match(/^(\w+)=(.*?)\r?$/)
+    const m = line.match(/^(\w+)=([^\r\n]*)$/)
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
   }
 } catch {}
@@ -68,20 +68,16 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    // PIDs recycle. Only SIGTERM if /proc confirms this is actually a prior
-    // poller (bun + server.ts in the cmdline) — otherwise we'd kill whatever
-    // unrelated process now owns that PID.
-    let looksLikeUs = false
-    try {
-      const cmdline = readFileSync(`/proc/${stale}/cmdline`, 'utf8')
-      looksLikeUs = cmdline.includes('bun') && cmdline.includes('server.ts')
-    } catch {}
-    if (looksLikeUs) {
+    // PIDs recycle, so verify this is actually a prior poller before we
+    // SIGTERM — otherwise we'd kill whatever unrelated process now owns
+    // that PID. /proc/<pid>/cmdline is Linux-only; on macOS/BSD the read
+    // throws, the outer catch swallows it, and stale pollers there must be
+    // reaped manually. Fine tradeoff — we prefer false-negative over
+    // killing an innocent process.
+    const cmdline = readFileSync(`/proc/${stale}/cmdline`, 'utf8')
+    if (cmdline.includes('bun') && cmdline.includes('server.ts')) {
       process.stderr.write(`telegram-mailbox: replacing stale poller pid=${stale}\n`)
       process.kill(stale, 'SIGTERM')
-    } else {
-      process.stderr.write(`telegram-mailbox: pid ${stale} in bot.pid not a mailbox poller — ignoring\n`)
     }
   }
 } catch {}
@@ -396,8 +392,7 @@ const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 // file_unique_id come from Telegram, but strip to safe chars so an
 // unexpected value can't introduce path separators or odd extensions.
 function inboxFilename(filePath: string, uniqueId: string | undefined, fallbackExt: string): string {
-  const rawExt = filePath.includes('.') ? filePath.split('.').pop()! : fallbackExt
-  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || fallbackExt
+  const ext = extname(filePath).slice(1).replace(/[^a-zA-Z0-9]/g, '') || fallbackExt
   const uid = (uniqueId ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
   return `${Date.now()}-${uid}.${ext}`
 }
