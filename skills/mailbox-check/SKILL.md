@@ -46,7 +46,7 @@ The `mailbox_read_new` tool only returns messages that already passed the server
 When invoked by `/loop /telegram-mailbox:mailbox-check` with no interval, arm a Monitor on the mailbox file so new messages wake the loop within seconds. The Monitor is the **sole** wake signal — do not call `ScheduleWakeup` to add a fallback heartbeat. Idle ticks would just burn a cache miss every ~25min with nothing to do; the Monitor is persistent and will fire as soon as new entries land. Do this **before** draining, so a Monitor is in place even when the current batch is empty.
 
 1. Call `TaskList`. If an existing persistent task's description mentions "telegram mailbox", it's already armed — skip to step 3.
-2. Arm the monitor (emits once per burst; quiets while there's unprocessed work so it doesn't spam during drain):
+2. Arm the monitor. It wakes on file growth (level-triggered on size change), not on ack state — so a forgotten ack can't silence future messages. `last` is in-shell only, so on monitor restart `last=0` causes one fire if the file is non-empty (intentional — drain anything sitting unprocessed at startup):
 
    ```
    Monitor({
@@ -54,15 +54,12 @@ When invoked by `/loop /telegram-mailbox:mailbox-check` with no interval, arm a 
      persistent: true,
      timeout_ms: 3600000,
      command: `mbox=~/.claude/channels/telegram-mailbox/mailbox.jsonl
-   offs=~/.claude/channels/telegram-mailbox/processed_offset
+   last=0
    while true; do
      size=$(stat -c%s "$mbox" 2>/dev/null || echo 0)
-     processed=$(cat "$offs" 2>/dev/null || echo 0)
-     if [ "$size" -gt "$processed" ]; then
-       echo "new mailbox entries: size=$size processed=$processed"
-       while [ "$(stat -c%s "$mbox" 2>/dev/null || echo 0)" -gt "$(cat "$offs" 2>/dev/null || echo 0)" ]; do
-         sleep 5
-       done
+     if [ "$size" -gt "$last" ]; then
+       echo "new mailbox entries: size=$size last=$last"
+       last=$size
      fi
      sleep 3
    done`
