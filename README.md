@@ -58,7 +58,7 @@ In any session where you want to accept phone-steering:
 /loop /telegram-mailbox:mailbox-check
 ```
 
-No interval — the loop runs in dynamic mode: it arms a filesystem `Monitor` on `mailbox.jsonl` and only wakes the session when new bytes arrive (plus a ~30 min fallback heartbeat). Idle cost is effectively zero; latency from phone to reply is a few seconds.
+No interval — the loop runs in dynamic mode: it arms a filesystem `Monitor` on `mailbox.jsonl` and only wakes the session when new bytes arrive. Idle cost is effectively zero; latency from phone to reply is a few seconds.
 
 `/pause`, `/resume`, `/status` are recognized as special commands; everything else is treated as an instruction for the current session.
 
