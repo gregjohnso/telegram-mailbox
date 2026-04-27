@@ -1,6 +1,6 @@
 # Telegram Mailbox
 
-A fork of the [official telegram plugin](https://github.com/anthropics/claude-plugins-official) that persists inbound Telegram messages to an on-disk mailbox instead of wiring them in as live session input. Use a `/loop` to drain the mailbox from any ordinary Claude session — **no `claude --channels` flag required**.
+A fork of the [official telegram plugin](https://github.com/anthropics/claude-plugins-official) that persists inbound Telegram messages to an on-disk mailbox instead of wiring them in as live session input. Use a `/loop` to drain the mailbox from any ordinary Claude session — **no `claude --channels` flag required** and no token utilization while in the loop.
 
 ## How it's different
 
