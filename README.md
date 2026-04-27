@@ -2,18 +2,6 @@
 
 A fork of the [official telegram plugin](https://github.com/anthropics/claude-plugins-official) that persists inbound Telegram messages to an on-disk mailbox instead of wiring them in as live session input. Use a `/loop` to drain the mailbox from any ordinary Claude session — **no `claude --channels` flag required** and no token utilization while in the loop.
 
-## How it's different
-
-| | Official `telegram` | `telegram-mailbox` (this fork) |
-|---|---|---|
-| Delivery | MCP notification → session input | Append to `mailbox.jsonl` |
-| Requires `--channels` at launch | yes | no |
-| Coupled to session lifecycle | yes | no |
-| Draining | automatic, in-session | `/loop /telegram-mailbox:mailbox-check` |
-| Bot token | same token, one `getUpdates` consumer only | **separate token from the official plugin** |
-
-Both plugins can run side-by-side as long as they use different bot tokens (Telegram returns 409 Conflict if two pollers share a token).
-
 ## Prerequisites
 
 - [Bun](https://bun.sh) — `curl -fsSL https://bun.sh/install | bash`. Make sure `~/.bun/bin` is on your `$PATH` in whichever shell launches Claude Code.
