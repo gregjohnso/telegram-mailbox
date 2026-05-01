@@ -43,31 +43,34 @@ The `mailbox_read_new` tool only returns messages that already passed the server
 
 ## Running under /loop (dynamic mode)
 
-When invoked by `/loop /telegram-mailbox:mailbox-check` with no interval, arm a Monitor on the mailbox file so new messages wake the loop within seconds. The Monitor is the **sole** wake signal — do not call `ScheduleWakeup` to add a fallback heartbeat. Idle ticks would just burn a cache miss every ~25min with nothing to do; the Monitor is persistent and will fire as soon as new entries land. Do this **before** draining, so a Monitor is in place even when the current batch is empty.
+When invoked by `/loop /telegram-mailbox:mailbox-check` with no interval, arm a Monitor that **is the bot poller** — it holds Telegram's exclusive `getUpdates` slot via a file lock and emits a stdout line each time it appends an inbound message to the mailbox. Each line wakes the /loop. The Monitor is the **sole** wake signal — do not call `ScheduleWakeup` to add a fallback heartbeat.
+
+The Monitor command runs `flock` against `~/.claude/channels/telegram-mailbox/poll.lock` before exec-ing the poller. If another session is already running its Monitor (i.e., already polling), `flock` blocks until that session releases the lock — at which point this Monitor silently takes over. No coordination beyond the lock; no PID files; the kernel releases on process death so crashes can't strand the slot.
 
 1. Call `TaskList`. If an existing persistent task's description mentions "telegram mailbox", it's already armed — skip to step 3.
-2. Arm the monitor. It wakes on file growth (level-triggered on size change), not on ack state — so a forgotten ack can't silence future messages. `last` is in-shell only, so on monitor restart `last=0` causes one fire if the file is non-empty (intentional — drain anything sitting unprocessed at startup):
+2. Arm the Monitor:
 
    ```
    Monitor({
-     description: "new telegram mailbox entries",
+     description: "telegram mailbox poller (holds flock + emits on new entries)",
      persistent: true,
      timeout_ms: 3600000,
-     command: `mbox=~/.claude/channels/telegram-mailbox/mailbox.jsonl
-   last=0
-   while true; do
-     size=$(stat -c%s "$mbox" 2>/dev/null || echo 0)
-     if [ "$size" -gt "$last" ]; then
-       echo "new mailbox entries: size=$size last=$last"
-       last=$size
-     fi
-     sleep 3
-   done`
+     command: `state=~/.claude/channels/telegram-mailbox
+   mkdir -p "$state"
+   touch "$state/poll.lock"
+   plugin_root=$(cat "$state/plugin_root" 2>/dev/null)
+   if [ -z "$plugin_root" ]; then
+     echo "telegram-mailbox poller: plugin_root not yet recorded — the MCP server hasn't started in this session" >&2
+     exit 1
+   fi
+   exec flock "$state/poll.lock" bun run --cwd "$plugin_root" --shell=bun --silent poller`
    })
    ```
 
-3. Drain the mailbox per the Flow section above.
+3. Drain the mailbox per the Flow section above. (The poller may emit "new mailbox entry: ..." lines while you're draining — those are just wake signals; the actual entries come from `mailbox_read_new`.)
 4. End the turn. Do not call `ScheduleWakeup` — the Monitor wakes the loop on its own when new entries arrive.
+
+If you message the bot from your phone and don't see a 👀 reaction within a few seconds, no session has the poller running. Either no `/loop /mailbox-check` is active, the lock is held by a session that's hung, or the MCP server hasn't recorded `plugin_root` yet (only happens if the plugin failed to load).
 
 ## Pause sentinel
 

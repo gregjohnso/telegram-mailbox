@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Telegram mailbox for Claude Code.
+ * Telegram mailbox MCP server for Claude Code.
  *
  * Forked from anthropics/claude-plugins-official telegram plugin. Instead of
  * wiring inbound messages into the session as live input (which requires
@@ -8,9 +8,12 @@
  * on disk. The mailbox-check skill (run under /loop) drains them via the
  * mailbox_read_new / mailbox_ack MCP tools.
  *
- * Self-contained MCP server with full access control: pairing, allowlists,
- * group support with mention-triggering. State lives in
- * ~/.claude/channels/telegram-mailbox/access.json — managed by the /telegram-mailbox:access skill.
+ * This server is API-only: it does not poll Telegram. The polling half lives
+ * in poller.ts, spawned by the mailbox-check skill's Monitor under flock so
+ * exactly one session at a time owns Telegram's getUpdates slot. Outbound
+ * methods (sendMessage, setMessageReaction, getFile, editMessageText) have no
+ * server-side exclusivity, so any number of MCP server instances across
+ * sessions can call them concurrently.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -19,26 +22,23 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { Bot, GrammyError, InputFile, type Context } from 'grammy'
+import { Bot, InputFile } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, readSync, closeSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, statSync, renameSync, realpathSync, chmodSync, openSync, readSync, closeSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
 const STATE_DIR = process.env.TELEGRAM_MAILBOX_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram-mailbox')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
-const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const MAILBOX_FILE = join(STATE_DIR, 'mailbox.jsonl')
 const PROCESSED_OFFSET_FILE = join(STATE_DIR, 'processed_offset')
-const RATE_LIMIT_WINDOW_MS = 60_000
-const RATE_LIMIT_MAX = 20
+const INBOX_DIR = join(STATE_DIR, 'inbox')
+const PLUGIN_ROOT_FILE = join(STATE_DIR, 'plugin_root')
 
 // Load .env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
 try {
-  // Token is a credential — lock to owner. No-op on Windows (would need ACLs).
   chmodSync(ENV_FILE, 0o600)
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
     const m = line.match(/^(\w+)=([^\r\n]*)$/)
@@ -57,34 +57,20 @@ if (!TOKEN) {
   )
   process.exit(1)
 }
-const INBOX_DIR = join(STATE_DIR, 'inbox')
-const PID_FILE = join(STATE_DIR, 'bot.pid')
 
-// Telegram allows exactly one getUpdates consumer per token. If a previous
-// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-// survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    // PIDs recycle, so verify this is actually a prior poller before we
-    // SIGTERM — otherwise we'd kill whatever unrelated process now owns
-    // that PID. /proc/<pid>/cmdline is Linux-only; on macOS/BSD the read
-    // throws, the outer catch swallows it, and stale pollers there must be
-    // reaped manually. Fine tradeoff — we prefer false-negative over
-    // killing an innocent process.
-    const cmdline = readFileSync(`/proc/${stale}/cmdline`, 'utf8')
-    if (cmdline.includes('bun') && cmdline.includes('server.ts')) {
-      process.stderr.write(`telegram-mailbox: replacing stale poller pid=${stale}\n`)
-      process.kill(stale, 'SIGTERM')
-    }
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid), { mode: 0o600 })
 
-// Last-resort safety net — without these the process dies silently on any
-// unhandled promise rejection. With them it logs and keeps serving tools.
+// Record the plugin root so the mailbox-check skill's Monitor can spawn the
+// poller without relying on ${CLAUDE_PLUGIN_ROOT} (which is set when the MCP
+// server is launched, but not in the shell environment Monitor commands run
+// in). The MCP server starts at session boot, before any skill invocation, so
+// this file is reliably present by the time a Monitor reads it.
+try {
+  writeFileSync(PLUGIN_ROOT_FILE, process.cwd() + '\n', { mode: 0o600 })
+} catch (err) {
+  process.stderr.write(`telegram-mailbox: failed to record plugin_root: ${err}\n`)
+}
+
 process.on('unhandledRejection', err => {
   process.stderr.write(`telegram-mailbox: unhandled rejection: ${err}\n`)
 })
@@ -92,16 +78,10 @@ process.on('uncaughtException', err => {
   process.stderr.write(`telegram-mailbox: uncaught exception: ${err}\n`)
 })
 
+// API-only Bot — never call bot.start(). Used for sendMessage / setMessageReaction
+// / getFile / editMessageText. No polling, no exclusivity at Telegram, safe to
+// instantiate concurrently across sessions.
 const bot = new Bot(TOKEN)
-let botUsername = ''
-
-type PendingEntry = {
-  senderId: string
-  chatId: string
-  createdAt: number
-  expiresAt: number
-  replies: number
-}
 
 type GroupPolicy = {
   requireMention: boolean
@@ -112,16 +92,11 @@ type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
   groups: Record<string, GroupPolicy>
-  pending: Record<string, PendingEntry>
-  mentionPatterns?: string[]
-  // delivery/UX config — optional, defaults live in the reply handler
-  /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
+  // The server only reads access — it doesn't mutate. pending/mentionPatterns
+  // live in the file but the server doesn't consult them.
   ackReaction?: string
-  /** Which chunks get Telegram's reply reference when reply_to is passed. Default: 'first'. 'off' = never thread. */
   replyToMode?: 'off' | 'first' | 'all'
-  /** Max chars per outbound message before splitting. Default: 4096 (Telegram's hard cap). */
   textChunkLimit?: number
-  /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
 }
 
@@ -130,8 +105,33 @@ function defaultAccess(): Access {
     dmPolicy: 'pairing',
     allowFrom: [],
     groups: {},
-    pending: {},
   }
+}
+
+function readAccessFile(): Access {
+  try {
+    const raw = readFileSync(ACCESS_FILE, 'utf8')
+    const parsed = JSON.parse(raw) as Partial<Access>
+    return {
+      dmPolicy: parsed.dmPolicy ?? 'pairing',
+      allowFrom: parsed.allowFrom ?? [],
+      groups: parsed.groups ?? {},
+      ackReaction: parsed.ackReaction,
+      replyToMode: parsed.replyToMode,
+      textChunkLimit: parsed.textChunkLimit,
+      chunkMode: parsed.chunkMode,
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
+    process.stderr.write(`telegram-mailbox: access.json read failed: ${err}\n`)
+    return defaultAccess()
+  }
+}
+
+const BOOT_ACCESS: Access | null = STATIC ? readAccessFile() : null
+
+function loadAccess(): Access {
+  return BOOT_ACCESS ?? readAccessFile()
 }
 
 const MAX_CHUNK_LIMIT = 4096
@@ -146,57 +146,11 @@ function assertSendable(f: string): void {
   try {
     real = realpathSync(f)
     stateReal = realpathSync(STATE_DIR)
-  } catch { return } // statSync will fail properly; or STATE_DIR absent → nothing to leak
+  } catch { return }
   const inbox = join(stateReal, 'inbox')
   if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
     throw new Error(`refusing to send channel state: ${f}`)
   }
-}
-
-function readAccessFile(): Access {
-  try {
-    const raw = readFileSync(ACCESS_FILE, 'utf8')
-    const parsed = JSON.parse(raw) as Partial<Access>
-    return {
-      dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
-      groups: parsed.groups ?? {},
-      pending: parsed.pending ?? {},
-      mentionPatterns: parsed.mentionPatterns,
-      ackReaction: parsed.ackReaction,
-      replyToMode: parsed.replyToMode,
-      textChunkLimit: parsed.textChunkLimit,
-      chunkMode: parsed.chunkMode,
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
-    try {
-      renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`)
-    } catch {}
-    process.stderr.write(`telegram-mailbox: access.json is corrupt, moved aside. Starting fresh.\n`)
-    return defaultAccess()
-  }
-}
-
-// In static mode, access is snapshotted at boot and never re-read or written.
-// Pairing requires runtime mutation, so it's downgraded to allowlist with a
-// startup warning — handing out codes that never get approved would be worse.
-const BOOT_ACCESS: Access | null = STATIC
-  ? (() => {
-      const a = readAccessFile()
-      if (a.dmPolicy === 'pairing') {
-        process.stderr.write(
-          'telegram-mailbox: static mode — dmPolicy "pairing" downgraded to "allowlist"\n',
-        )
-        a.dmPolicy = 'allowlist'
-      }
-      a.pending = {}
-      return a
-    })()
-  : null
-
-function loadAccess(): Access {
-  return BOOT_ACCESS ?? readAccessFile()
 }
 
 // Outbound gate — reply/react/edit can only target chats the inbound gate
@@ -208,161 +162,8 @@ function assertAllowedChat(chat_id: string): void {
   throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram-mailbox:access`)
 }
 
-function saveAccess(a: Access): void {
-  if (STATIC) return
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-  const tmp = ACCESS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
-  renameSync(tmp, ACCESS_FILE)
-}
-
-function pruneExpired(a: Access): boolean {
-  const now = Date.now()
-  let changed = false
-  for (const [code, p] of Object.entries(a.pending)) {
-    if (p.expiresAt < now) {
-      delete a.pending[code]
-      changed = true
-    }
-  }
-  return changed
-}
-
-type GateResult =
-  | { action: 'deliver'; access: Access }
-  | { action: 'drop' }
-  | { action: 'pair'; code: string; isResend: boolean }
-
-function gate(ctx: Context): GateResult {
-  const access = loadAccess()
-  const pruned = pruneExpired(access)
-  if (pruned) saveAccess(access)
-
-  if (access.dmPolicy === 'disabled') return { action: 'drop' }
-
-  const from = ctx.from
-  if (!from) return { action: 'drop' }
-  const senderId = String(from.id)
-  const chatType = ctx.chat?.type
-
-  if (chatType === 'private') {
-    if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
-    if (access.dmPolicy === 'allowlist') return { action: 'drop' }
-
-    // pairing mode — check for existing non-expired code for this sender
-    for (const [code, p] of Object.entries(access.pending)) {
-      if (p.senderId === senderId) {
-        // Reply twice max (initial + one reminder), then go silent.
-        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
-        p.replies = (p.replies ?? 1) + 1
-        saveAccess(access)
-        return { action: 'pair', code, isResend: true }
-      }
-    }
-    // Cap pending at 3. Extra attempts are silently dropped.
-    if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
-
-    const code = randomBytes(3).toString('hex') // 6 hex chars
-    const now = Date.now()
-    access.pending[code] = {
-      senderId,
-      chatId: String(ctx.chat!.id),
-      createdAt: now,
-      expiresAt: now + 60 * 60 * 1000, // 1h
-      replies: 1,
-    }
-    saveAccess(access)
-    return { action: 'pair', code, isResend: false }
-  }
-
-  if (chatType === 'group' || chatType === 'supergroup') {
-    const groupId = String(ctx.chat!.id)
-    const policy = access.groups[groupId]
-    if (!policy) return { action: 'drop' }
-    const groupAllowFrom = policy.allowFrom ?? []
-    const requireMention = policy.requireMention ?? true
-    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
-      return { action: 'drop' }
-    }
-    if (requireMention && !isMentioned(ctx, access.mentionPatterns)) {
-      return { action: 'drop' }
-    }
-    return { action: 'deliver', access }
-  }
-
-  return { action: 'drop' }
-}
-
-// Like gate() but for bot commands: no pairing side effects, just allow/drop.
-function dmCommandGate(ctx: Context): { access: Access; senderId: string } | null {
-  if (ctx.chat?.type !== 'private') return null
-  if (!ctx.from) return null
-  const senderId = String(ctx.from.id)
-  const access = loadAccess()
-  const pruned = pruneExpired(access)
-  if (pruned) saveAccess(access)
-  if (access.dmPolicy === 'disabled') return null
-  if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(senderId)) return null
-  return { access, senderId }
-}
-
-function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
-  const entities = ctx.message?.entities ?? ctx.message?.caption_entities ?? []
-  const text = ctx.message?.text ?? ctx.message?.caption ?? ''
-  for (const e of entities) {
-    if (e.type === 'mention') {
-      const mentioned = text.slice(e.offset, e.offset + e.length)
-      if (mentioned.toLowerCase() === `@${botUsername}`.toLowerCase()) return true
-    }
-    if (e.type === 'text_mention' && e.user?.is_bot && e.user.username === botUsername) {
-      return true
-    }
-  }
-
-  // Reply to one of our messages counts as an implicit mention.
-  if (ctx.message?.reply_to_message?.from?.username === botUsername) return true
-
-  for (const pat of extraPatterns ?? []) {
-    try {
-      if (new RegExp(pat, 'i').test(text)) return true
-    } catch {
-      // Invalid user-supplied regex — skip it.
-    }
-  }
-  return false
-}
-
-// The /telegram-mailbox:access skill drops a file at approved/<senderId> when it pairs
-// someone. Poll for it, send confirmation, clean up. For Telegram DMs,
-// chatId == senderId, so we can send directly without stashing chatId.
-
-function checkApprovals(): void {
-  let files: string[]
-  try {
-    files = readdirSync(APPROVED_DIR)
-  } catch {
-    return
-  }
-  if (files.length === 0) return
-
-  for (const senderId of files) {
-    const file = join(APPROVED_DIR, senderId)
-    void bot.api.sendMessage(senderId, "Paired! Say hi to Claude.").then(
-      () => rmSync(file, { force: true }),
-      err => {
-        process.stderr.write(`telegram-mailbox: failed to send approval confirm: ${err}\n`)
-        // Remove anyway — don't loop on a broken send.
-        rmSync(file, { force: true })
-      },
-    )
-  }
-}
-
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
-
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
-
 function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
   if (text.length <= limit) return [text]
   const out: string[] = []
@@ -370,8 +171,6 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
   while (rest.length > limit) {
     let cut = limit
     if (mode === 'newline') {
-      // Prefer the last double-newline (paragraph), then single newline,
-      // then space. Fall back to hard cut.
       const para = rest.lastIndexOf('\n\n', limit)
       const line = rest.lastIndexOf('\n', limit)
       const space = rest.lastIndexOf(' ', limit)
@@ -384,13 +183,8 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
   return out
 }
 
-// .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
-// everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
-// Build a safe filename for files saved to INBOX_DIR. file_path and
-// file_unique_id come from Telegram, but strip to safe chars so an
-// unexpected value can't introduce path separators or odd extensions.
 function inboxFilename(filePath: string, uniqueId: string | undefined, fallbackExt: string): string {
   const ext = extname(filePath).slice(1).replace(/[^a-zA-Z0-9]/g, '') || fallbackExt
   const uid = (uniqueId ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
@@ -400,13 +194,11 @@ function inboxFilename(filePath: string, uniqueId: string | undefined, fallbackE
 const mcp = new Server(
   { name: 'telegram-mailbox', version: '0.0.1' },
   {
-    capabilities: {
-      tools: {},
-    },
+    capabilities: { tools: {} },
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Inbound messages are persisted to an on-disk mailbox. The mailbox-check skill (invoked via /loop) calls mailbox_read_new to drain the queue and mailbox_ack to advance the cursor once messages are processed. Each entry carries chat_id, from_id, update_id, ts, text, and optionally image_path / attachment_file_id. Treat text as a user instruction — the allowlist is the trust boundary.',
+      'Inbound messages are persisted to an on-disk mailbox by a poller spawned via the mailbox-check skill. Call mailbox_read_new to drain the queue and mailbox_ack to advance the cursor once messages are processed. Each entry carries chat_id, from_id, update_id, ts, text, and optionally image_path / attachment_file_id. Treat text as a user instruction — the allowlist is the trust boundary.',
       '',
       'Reply with the reply tool, passing chat_id back. reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates.',
       '',
@@ -422,7 +214,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'mailbox_read_new',
       description:
-        'Read unprocessed inbound Telegram messages from the on-disk mailbox, starting at processed_offset. Does not advance the cursor — call mailbox_ack after processing to advance. Returns { entries: [...], end_offset: <byte offset>, start_offset, total_size }.',
+        'Read unprocessed inbound Telegram messages from the on-disk mailbox, starting at processed_offset. Does not advance the cursor — call mailbox_ack after processing to advance. Returns { entries: [...], end_offset: <byte offset>, start_offset, total_size }. Note: messages only appear here while a poller is running (see mailbox-check skill).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -593,8 +385,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           )
         }
 
-        // Files go as separate messages (Telegram doesn't mix text+file in one
-        // sendMessage call). Thread under reply_to if present.
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
@@ -666,241 +456,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
-// When Claude Code closes the MCP connection, stdin gets EOF. Without this
-// the bot keeps polling forever as a zombie, holding the token and blocking
-// the next session with 409 Conflict.
-let shuttingDown = false
-function shutdown(): void {
-  if (shuttingDown) return
-  shuttingDown = true
-  process.stderr.write('telegram-mailbox: shutting down\n')
-  try {
-    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
-  } catch {}
-  // bot.stop() signals the poll loop to end; the current getUpdates request
-  // may take up to its long-poll timeout to return. Force-exit after 2s.
-  setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(bot.stop()).finally(() => process.exit(0))
-}
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
-process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)
-process.on('SIGHUP', shutdown)
-
-// Orphan watchdog: stdin events above don't reliably fire when the parent
-// chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
-// reparenting (POSIX) or a dead stdin pipe and self-terminate.
-const bootPpid = process.ppid
-setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) shutdown()
-}, 5000).unref()
-
-// Commands are DM-only. Responding in groups would: (1) leak pairing codes via
-// /status to other group members, (2) confirm bot presence in non-allowlisted
-// groups, (3) spam channels the operator never approved. Silent drop matches
-// the gate's behavior for unrecognized groups.
-
-bot.command('start', async ctx => {
-  if (!dmCommandGate(ctx)) return
-  await ctx.reply(
-    `This bot bridges Telegram to a Claude Code session.\n\n` +
-    `To pair:\n` +
-    `1. DM me anything — you'll get a 6-char code\n` +
-    `2. In Claude Code: /telegram-mailbox:access pair <code>\n\n` +
-    `After that, DMs here reach that session.`
-  )
-})
-
-bot.command('help', async ctx => {
-  if (!dmCommandGate(ctx)) return
-  await ctx.reply(
-    `Messages you send here route to a paired Claude Code session. ` +
-    `Text and photos are forwarded; replies and reactions come back.\n\n` +
-    `/start — pairing instructions\n` +
-    `/status — check your pairing state`
-  )
-})
-
-bot.command('status', async ctx => {
-  const gated = dmCommandGate(ctx)
-  if (!gated) return
-  const { access, senderId } = gated
-
-  if (access.allowFrom.includes(senderId)) {
-    const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
-    await ctx.reply(`Paired as ${name}.`)
-    return
-  }
-
-  for (const [code, p] of Object.entries(access.pending)) {
-    if (p.senderId === senderId) {
-      await ctx.reply(
-        `Pending pairing — run in Claude Code:\n\n/telegram-mailbox:access pair ${code}`
-      )
-      return
-    }
-  }
-
-  await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
-})
-
-bot.on('message:text', async ctx => {
-  await handleInbound(ctx, ctx.message.text, undefined)
-})
-
-bot.on('message:photo', async ctx => {
-  const caption = ctx.message.caption ?? '(photo)'
-  // Defer download until after the gate approves — any user can send photos,
-  // and we don't want to burn API quota or fill the inbox for dropped messages.
-  await handleInbound(ctx, caption, async () => {
-    // Largest size is last in the array.
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
-    try {
-      const file = await ctx.api.getFile(best.file_id)
-      if (!file.file_path) return undefined
-      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await fetch(url)
-      const buf = Buffer.from(await res.arrayBuffer())
-      const path = join(INBOX_DIR, inboxFilename(file.file_path, best.file_unique_id, 'jpg'))
-      mkdirSync(INBOX_DIR, { recursive: true })
-      writeFileSync(path, buf)
-      return path
-    } catch (err) {
-      process.stderr.write(`telegram-mailbox: photo download failed: ${err}\n`)
-      return undefined
-    }
-  })
-})
-
-bot.on('message:document', async ctx => {
-  const doc = ctx.message.document
-  const name = safeName(doc.file_name)
-  const text = ctx.message.caption ?? `(document: ${name ?? 'file'})`
-  await handleInbound(ctx, text, undefined, {
-    kind: 'document',
-    file_id: doc.file_id,
-    size: doc.file_size,
-    mime: doc.mime_type,
-    name,
-  })
-})
-
-bot.on('message:voice', async ctx => {
-  const voice = ctx.message.voice
-  const text = ctx.message.caption ?? '(voice message)'
-  await handleInbound(ctx, text, undefined, {
-    kind: 'voice',
-    file_id: voice.file_id,
-    size: voice.file_size,
-    mime: voice.mime_type,
-  })
-})
-
-bot.on('message:audio', async ctx => {
-  const audio = ctx.message.audio
-  const name = safeName(audio.file_name)
-  const text = ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`
-  await handleInbound(ctx, text, undefined, {
-    kind: 'audio',
-    file_id: audio.file_id,
-    size: audio.file_size,
-    mime: audio.mime_type,
-    name,
-  })
-})
-
-bot.on('message:video', async ctx => {
-  const video = ctx.message.video
-  const text = ctx.message.caption ?? '(video)'
-  await handleInbound(ctx, text, undefined, {
-    kind: 'video',
-    file_id: video.file_id,
-    size: video.file_size,
-    mime: video.mime_type,
-    name: safeName(video.file_name),
-  })
-})
-
-bot.on('message:video_note', async ctx => {
-  const vn = ctx.message.video_note
-  await handleInbound(ctx, '(video note)', undefined, {
-    kind: 'video_note',
-    file_id: vn.file_id,
-    size: vn.file_size,
-  })
-})
-
-bot.on('message:sticker', async ctx => {
-  const sticker = ctx.message.sticker
-  const emoji = sticker.emoji ? ` ${sticker.emoji}` : ''
-  await handleInbound(ctx, `(sticker${emoji})`, undefined, {
-    kind: 'sticker',
-    file_id: sticker.file_id,
-    size: sticker.file_size,
-  })
-})
-
-type AttachmentMeta = {
-  kind: string
-  file_id: string
-  size?: number
-  mime?: string
-  name?: string
-}
-
-// Filenames and titles are uploader-controlled. Strip delimiter chars so
-// they can't forge JSON fields or break out of string contexts downstream.
-function safeName(s: string | undefined): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;"\\]/g, '_')
-}
-
-// Per-sender sliding-window rate limiter. 20 msg / 60s → drop excess with
-// one "rate limited" reply per minute per sender (so the cap itself doesn't
-// become an outbound flood back to Telegram).
-const rateWindow = new Map<string, number[]>()
-const rateNotifiedAt = new Map<string, number>()
-
-function rateLimitAllow(senderId: string): boolean {
-  const now = Date.now()
-  const cutoff = now - RATE_LIMIT_WINDOW_MS
-  const times = (rateWindow.get(senderId) ?? []).filter(t => t > cutoff)
-  if (times.length >= RATE_LIMIT_MAX) {
-    rateWindow.set(senderId, times)
-    return false
-  }
-  times.push(now)
-  rateWindow.set(senderId, times)
-  return true
-}
-
-function maybeReplyRateLimited(ctx: Context, senderId: string): void {
-  const now = Date.now()
-  const last = rateNotifiedAt.get(senderId) ?? 0
-  if (now - last < RATE_LIMIT_WINDOW_MS) return
-  rateNotifiedAt.set(senderId, now)
-  void ctx.reply(`rate limited — max ${RATE_LIMIT_MAX}/min`).catch(() => {})
-}
-
-// Evict sender entries idle past the window so the maps don't grow
-// unbounded over the lifetime of the process.
-setInterval(() => {
-  const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS
-  for (const [id, times] of rateWindow) {
-    const kept = times.filter(t => t > cutoff)
-    if (kept.length === 0) rateWindow.delete(id)
-    else if (kept.length !== times.length) rateWindow.set(id, kept)
-  }
-  for (const [id, last] of rateNotifiedAt) {
-    if (last <= cutoff) rateNotifiedAt.delete(id)
-  }
-}, RATE_LIMIT_WINDOW_MS).unref()
-
 // Mailbox helpers. Consumer (the mailbox-check skill under /loop) reads
 // entries from `processed_offset` to EOF via mailbox_read_new, then calls
 // mailbox_ack to advance the cursor. Read/ack are split so a consumer crash
@@ -938,14 +493,14 @@ function readMailboxRange(startOffset: number, limit?: number): {
   }
   try {
     const size = statSync(MAILBOX_FILE).size
-    if (startOffset > size) return { entries, end_offset: size } // file rotated/truncated
+    if (startOffset > size) return { entries, end_offset: size }
     const buf = Buffer.alloc(size - startOffset)
     readSync(fd, buf, 0, buf.length, startOffset)
     let pos = 0
     const text = buf.toString('utf8')
     while (pos < text.length) {
       const nl = text.indexOf('\n', pos)
-      if (nl === -1) break // partial trailing line — leave for next read
+      if (nl === -1) break
       const line = text.slice(pos, nl)
       pos = nl + 1
       if (!line) continue
@@ -962,125 +517,3 @@ function readMailboxRange(startOffset: number, limit?: number): {
   }
   return { entries, end_offset: end }
 }
-
-async function handleInbound(
-  ctx: Context,
-  text: string,
-  downloadImage: (() => Promise<string | undefined>) | undefined,
-  attachment?: AttachmentMeta,
-): Promise<void> {
-  const result = gate(ctx)
-
-  if (result.action === 'drop') return
-
-  if (result.action === 'pair') {
-    const lead = result.isResend ? 'Still pending' : 'Pairing required'
-    await ctx.reply(
-      `${lead} — run in Claude Code:\n\n/telegram-mailbox:access pair ${result.code}`,
-    )
-    return
-  }
-
-  const from = ctx.from!
-  const chat_id = String(ctx.chat!.id)
-  const msgId = ctx.message?.message_id
-
-  // Rate limit per sender — sliding window, drop excess.
-  if (!rateLimitAllow(String(from.id))) {
-    maybeReplyRateLimited(ctx, String(from.id))
-    return
-  }
-
-  // Ack receipt with an emoji reaction on the sender's message. Default 👀;
-  // empty string in access.json disables. Fire-and-forget — a bad emoji or
-  // missing group reaction perms shouldn't block mailbox delivery.
-  const ackEmoji = result.access.ackReaction ?? '👀'
-  if (ackEmoji && msgId != null) {
-    void bot.api.setMessageReaction(chat_id, msgId, [
-      { type: 'emoji', emoji: ackEmoji as ReactionTypeEmoji['emoji'] },
-    ]).catch(err => {
-      process.stderr.write(`telegram-mailbox: ackReaction failed: ${err}\n`)
-    })
-  }
-
-  // Download images eagerly — file_ids expire, and /loop may not drain the
-  // mailbox for a while.
-  const imagePath = downloadImage ? await downloadImage() : undefined
-
-  // Append to the on-disk mailbox, then ack so the phone sees it landed.
-  const entry = {
-    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-    update_id: ctx.update.update_id,
-    from_id: String(from.id),
-    chat_id,
-    ...(msgId != null ? { message_id: msgId } : {}),
-    user: from.username ?? String(from.id),
-    text,
-    ...(imagePath ? { image_path: imagePath } : {}),
-    ...(attachment ? {
-      attachment_kind: attachment.kind,
-      attachment_file_id: attachment.file_id,
-      ...(attachment.size != null ? { attachment_size: attachment.size } : {}),
-      ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-      ...(attachment.name ? { attachment_name: attachment.name } : {}),
-    } : {}),
-  }
-  try {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-    appendFileSync(MAILBOX_FILE, JSON.stringify(entry) + '\n', { mode: 0o600 })
-  } catch (err) {
-    process.stderr.write(`telegram-mailbox: failed to append mailbox entry: ${err}\n`)
-  }
-}
-
-// Without this, any throw in a message handler stops polling permanently
-// (grammy's default error handler calls bot.stop() and rethrows).
-bot.catch(err => {
-  process.stderr.write(`telegram-mailbox: handler error (polling continues): ${err.error}\n`)
-})
-
-// Retry polling with backoff on any error. Previously only 409 was retried —
-// a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
-// returned, and polling stopped permanently while the process stayed alive
-// (MCP stdin keeps it running). Outbound tools kept working but the bot was
-// deaf to inbound messages until a full restart.
-void (async () => {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      await bot.start({
-        onStart: info => {
-          attempt = 0
-          botUsername = info.username
-          process.stderr.write(`telegram-mailbox: polling as @${info.username}\n`)
-          void bot.api.setMyCommands(
-            [
-              { command: 'start', description: 'Welcome and setup guide' },
-              { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
-            ],
-            { scope: { type: 'all_private_chats' } },
-          ).catch(() => {})
-        },
-      })
-      return // bot.stop() was called — clean exit from the loop
-    } catch (err) {
-      if (shuttingDown) return
-      // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
-      if (err instanceof Error && err.message === 'Aborted delay') return
-      const is409 = err instanceof GrammyError && err.error_code === 409
-      if (is409 && attempt >= 8) {
-        process.stderr.write(
-          `telegram-mailbox: 409 Conflict persists after ${attempt} attempts — ` +
-          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
-        )
-        return
-      }
-      const delay = Math.min(1000 * attempt, 15000)
-      const detail = is409
-        ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
-        : `polling error: ${err}`
-      process.stderr.write(`telegram-mailbox: ${detail}, retrying in ${delay / 1000}s\n`)
-      await new Promise(r => setTimeout(r, delay))
-    }
-  }
-})()
