@@ -5,7 +5,8 @@
   "type": "module",
   "bin": "./server.ts",
   "scripts": {
-    "start": "bun install --no-summary && bun server.ts"
+    "start": "bun install --no-summary && bun server.ts",
+    "poller": "bun install --no-summary && bun poller.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
