@@ -63,7 +63,7 @@ The Monitor command runs `flock` against `~/.claude/channels/telegram-mailbox/po
      echo "telegram-mailbox poller: plugin_root not yet recorded — the MCP server hasn't started in this session" >&2
      exit 1
    fi
-   exec flock "$state/poll.lock" bun run --cwd "$plugin_root" --silent poller`
+   exec flock "$state/poll.lock" bun run --cwd "$plugin_root" --shell=bun --silent poller`
    })
    ```
 
