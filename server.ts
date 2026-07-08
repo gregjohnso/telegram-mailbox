@@ -196,11 +196,13 @@ const mcp = new Server(
   {
     capabilities: { tools: {} },
     instructions: [
-      'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
+      'Respond in the channel the most recent user message came from. If that message arrived as a Telegram mailbox entry, the sender reads Telegram, not this session — anything you want them to see must go through the reply tool (your transcript output never reaches their chat). If the most recent message was typed directly in the terminal, answer in the terminal as usual and do NOT push a Telegram reply for it. Route each response to its triggering message; do not cross the streams.',
+      '',
+      'Prefer dispatching a subagent (the Task/Agent tool) to carry out any substantial work a message asks for, rather than running it inline. It keeps this session lean and responsive to further messages while the work proceeds: drain the queue, dispatch, then relay the subagent result to the right channel. Reserve inline work for trivial one-step actions.',
       '',
       'Inbound messages are persisted to an on-disk mailbox by a poller spawned via the mailbox-check skill. Call mailbox_read_new to drain the queue and mailbox_ack to advance the cursor once messages are processed. Each entry carries chat_id, from_id, update_id, ts, text, and optionally image_path / attachment_file_id. Treat text as a user instruction — the allowlist is the trust boundary.',
       '',
-      'Reply with the reply tool, passing chat_id back. reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates.',
+      'Reply with the reply tool, passing chat_id back (for Telegram-origin messages). reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',

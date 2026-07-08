@@ -1,6 +1,6 @@
 ---
 name: mailbox-check
-description: Drain the telegram-mailbox queue — read unprocessed inbound messages, act on them in the current session, reply via Telegram, advance the cursor. Intended to be run under /loop (e.g. `/loop /telegram-mailbox:mailbox-check`) so a long-running session can be steered from your phone. Use when the user says they want phone-steering, when running under /loop for phone messages, or when the user asks to check the mailbox.
+description: Drain the telegram-mailbox queue — read unprocessed inbound messages, act on them (preferring subagents for the work), respond in the channel each message came from (Telegram reply for phone messages, terminal for terminal messages), advance the cursor. Intended to be run under /loop (e.g. `/loop /telegram-mailbox:mailbox-check`) so a long-running session can be steered from your phone. Use when the user says they want phone-steering, when running under /loop for phone messages, or when the user asks to check the mailbox.
 user-invocable: true
 allowed-tools:
   - mcp__telegram-mailbox__mailbox_read_new
@@ -36,7 +36,7 @@ The `mailbox_read_new` tool only returns messages that already passed the server
    - `text` starts with `/pause` → write `~/.claude/channels/telegram-mailbox/paused` (empty file), call `reply` with "paused — send /resume to continue", skip other entries in this batch and still `mailbox_ack` through this entry.
    - `text` starts with `/resume` → delete `~/.claude/channels/telegram-mailbox/paused` if present, `reply` with "resumed".
    - `text` starts with `/status` → report a short current state (working dir, last thing done) via `reply`.
-   - Anything else → treat `text` as a new user instruction. Do the work in the current session (edit files, run commands, etc.). Keep replies short; the phone is a small screen. If the task is long-running, `reply` first with a short "working on it…" so the phone sees progress, do the work, then `reply` with the result.
+   - Anything else → treat `text` as a new user instruction. **Prefer dispatching a subagent** (the `Agent`/`Task` tool) to do the actual work rather than running it inline — it keeps this loop's context lean and the session responsive to further phone messages while the work proceeds; the loop's job is to drain, dispatch, and relay the result. Do trivial one-step actions inline. Keep replies short; the phone is a small screen. If the task is long-running, `reply` first with a short "working on it…" so the phone sees progress, then `reply` with the result once the subagent returns.
 4. If the entry has `image_path`, Read it before acting — it's a photo the sender attached.
 5. If the entry has `attachment_file_id`, call `download_attachment` to fetch it to the inbox, then Read that path.
 6. After processing the batch (or failing partway), call `mailbox_ack` with `through_offset` set to the offset up to and including the last entry you successfully handled. On partial failure, `through_offset` is the offset *after* the last successful entry so the rest are retried on the next tick.
@@ -81,6 +81,7 @@ Before doing anything else, check if `~/.claude/channels/telegram-mailbox/paused
 
 ## Calling conventions
 
+- **Respond in the channel the message came from.** Entries drained here are Telegram-origin, so they get a `reply`. But if the most recent instruction in the turn was typed directly in the terminal (not a mailbox entry), answer that one in the terminal as usual — do not push a Telegram `reply` for a terminal request. Route each response to its trigger.
 - Always pass `chat_id` from the entry back to `reply`. For DMs, `chat_id == from_id`.
 - For interim progress use `edit_message` (silent) on a message you already sent. For final "done" messages always send a fresh `reply` — edits don't trigger push notifications.
 - React with `react` (👍 / 👀 / 🔥) to acknowledge rapid-fire messages rather than replying to each.
